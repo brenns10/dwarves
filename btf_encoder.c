@@ -36,8 +36,6 @@ struct elf_function {
 	bool		 generated;
 };
 
-#define MAX_PERCPU_VAR_CNT 4096
-
 struct var_info {
 	uint64_t    addr;
 	const char *name;
@@ -59,13 +57,6 @@ struct btf_encoder {
 			  gen_floats,
 			  is_rel;
 	uint32_t	  array_index_id;
-	struct {
-		struct var_info vars[MAX_PERCPU_VAR_CNT];
-		int		var_cnt;
-		uint32_t	shndx;
-		uint64_t	base_addr;
-		uint64_t	sec_sz;
-	} percpu;
 	struct {
 		struct elf_function *entries;
 		int		    allocated;
@@ -595,17 +586,6 @@ static int32_t btf_encoder__add_var(struct btf_encoder *encoder, uint32_t type, 
 	return id;
 }
 
-static int32_t btf_encoder__add_var_secinfo(struct btf_encoder *encoder, uint32_t type,
-				     uint32_t offset, uint32_t size)
-{
-	struct btf_var_secinfo si = {
-		.type = type,
-		.offset = offset,
-		.size = size,
-	};
-	return gobuffer__add(&encoder->percpu_secinfo, &si, sizeof(si));
-}
-
 static int32_t btf_encoder__add_datasec(struct btf_encoder *encoder, const char *section_name)
 {
 	struct gobuffer *var_secinfo_buf = &encoder->percpu_secinfo;
@@ -725,48 +705,7 @@ static struct elf_function *btf_encoder__find_function(const struct btf_encoder 
 	return bsearch(&key, encoder->functions.entries, encoder->functions.cnt, sizeof(key), functions_cmp);
 }
 
-static bool btf_name_char_ok(char c, bool first)
-{
-	if (c == '_' || c == '.')
-		return true;
-
-	return first ? isalpha(c) : isalnum(c);
-}
-
 /* Check whether the given name is valid in vmlinux btf. */
-static bool btf_name_valid(const char *p)
-{
-	const char *limit;
-
-	if (!btf_name_char_ok(*p, true))
-		return false;
-
-	/* set a limit on identifier length */
-	limit = p + KSYM_NAME_LEN;
-	p++;
-	while (*p && p < limit) {
-		if (!btf_name_char_ok(*p, false))
-			return false;
-		p++;
-	}
-
-	return !*p;
-}
-
-static void dump_invalid_symbol(const char *msg, const char *sym,
-				int verbose, bool force)
-{
-	if (force) {
-		if (verbose)
-			fprintf(stderr, "PAHOLE: Warning: %s, ignored (sym: '%s').\n",
-				msg, sym);
-		return;
-	}
-
-	fprintf(stderr, "PAHOLE: Error: %s (sym: '%s').\n", msg, sym);
-	fprintf(stderr, "PAHOLE: Error: Use '--btf_encode_force' to ignore such symbols and force emit the btf.\n");
-}
-
 static int tag__check_id_drift(const struct tag *tag,
 			       uint32_t core_id, uint32_t btf_type_id,
 			       uint32_t type_id_off)
@@ -1059,102 +998,17 @@ int btf_encoder__encode(struct btf_encoder *encoder)
 	return err;
 }
 
-static int percpu_var_cmp(const void *_a, const void *_b)
-{
-	const struct var_info *a = _a;
-	const struct var_info *b = _b;
-
-	if (a->addr == b->addr)
-		return 0;
-	return a->addr < b->addr ? -1 : 1;
-}
-
-static bool btf_encoder__percpu_var_exists(struct btf_encoder *encoder, uint64_t addr, uint32_t *sz, const char **name)
-{
-	struct var_info key = { .addr = addr };
-	const struct var_info *p = bsearch(&key, encoder->percpu.vars, encoder->percpu.var_cnt,
-					   sizeof(encoder->percpu.vars[0]), percpu_var_cmp);
-	if (!p)
-		return false;
-
-	*sz = p->sz;
-	*name = p->name;
-	return true;
-}
-
-static int btf_encoder__collect_percpu_var(struct btf_encoder *encoder, GElf_Sym *sym, size_t sym_sec_idx)
-{
-	const char *sym_name;
-	uint64_t addr;
-	uint32_t size;
-
-	/* compare a symbol's shndx to determine if it's a percpu variable */
-	if (sym_sec_idx != encoder->percpu.shndx)
-		return 0;
-	if (elf_sym__type(sym) != STT_OBJECT)
-		return 0;
-
-	addr = elf_sym__value(sym);
-
-	size = elf_sym__size(sym);
-	if (!size)
-		return 0; /* ignore zero-sized symbols */
-
-	sym_name = elf_sym__name(sym, encoder->symtab);
-	if (!btf_name_valid(sym_name)) {
-		dump_invalid_symbol("Found symbol of invalid name when encoding btf",
-				    sym_name, encoder->verbose, encoder->force);
-		if (encoder->force)
-			return 0;
-		return -1;
-	}
-
-	if (encoder->verbose)
-		printf("Found per-CPU symbol '%s' at address 0x%" PRIx64 "\n", sym_name, addr);
-
-	/* Make sure addr is section-relative. For kernel modules (which are
-	 * ET_REL files) this is already the case. For vmlinux (which is an
-	 * ET_EXEC file) we need to subtract the section address.
-	 */
-	if (!encoder->is_rel)
-		addr -= encoder->percpu.base_addr;
-
-	if (encoder->percpu.var_cnt == MAX_PERCPU_VAR_CNT) {
-		fprintf(stderr, "Reached the limit of per-CPU variables: %d\n",
-			MAX_PERCPU_VAR_CNT);
-		return -1;
-	}
-	encoder->percpu.vars[encoder->percpu.var_cnt].addr = addr;
-	encoder->percpu.vars[encoder->percpu.var_cnt].sz = size;
-	encoder->percpu.vars[encoder->percpu.var_cnt].name = sym_name;
-	encoder->percpu.var_cnt++;
-
-	return 0;
-}
-
 static int btf_encoder__collect_symbols(struct btf_encoder *encoder, bool collect_percpu_vars)
 {
 	Elf32_Word sym_sec_idx;
 	uint32_t core_id;
 	GElf_Sym sym;
-
-	/* cache variables' addresses, preparing for searching in symtab. */
-	encoder->percpu.var_cnt = 0;
+	(void)collect_percpu_vars;
 
 	/* search within symtab for percpu variables */
 	elf_symtab__for_each_symbol_index(encoder->symtab, core_id, sym, sym_sec_idx) {
-		if (collect_percpu_vars && btf_encoder__collect_percpu_var(encoder, &sym, sym_sec_idx))
-			return -1;
 		if (btf_encoder__collect_function(encoder, &sym))
 			return -1;
-	}
-
-	if (collect_percpu_vars) {
-		if (encoder->percpu.var_cnt)
-			qsort(encoder->percpu.vars, encoder->percpu.var_cnt, sizeof(encoder->percpu.vars[0]), percpu_var_cmp);
-
-		if (encoder->verbose)
-			printf("Found %d per-CPU variables!\n", encoder->percpu.var_cnt);
 	}
 
 	if (encoder->functions.cnt) {
@@ -1184,16 +1038,13 @@ static int btf_encoder__encode_cu_variables(struct btf_encoder *encoder, struct 
 	struct tag *pos;
 	int err = -1;
 
-	if (encoder->percpu.shndx == 0 || !encoder->symtab)
-		return 0;
-
 	if (encoder->verbose)
 		printf("search cu '%s' for percpu global variables.\n", cu->name);
 
 	cu__for_each_variable(cu, core_id, pos) {
 		struct variable *var = tag__variable(pos);
-		uint32_t size, type, linkage;
-		const char *name, *dwarf_name;
+		uint32_t type, linkage;
+		const char *dwarf_name;
 		struct llvm_annotation *annot;
 		const struct tag *tag;
 		uint64_t addr;
@@ -1208,18 +1059,12 @@ static int btf_encoder__encode_cu_variables(struct btf_encoder *encoder, struct 
 
 		/* addr has to be recorded before we follow spec */
 		addr = var->ip.addr;
+
+		if (var->spec)
+			var = var->spec;
+
+		/* name has to be recorded after we follow spec */
 		dwarf_name = variable__name(var);
-
-		/* Make sure addr is section-relative. DWARF, unlike ELF,
-		 * always contains virtual symbol addresses, so subtract
-		 * the section address unconditionally.
-		 */
-		if (addr < encoder->percpu.base_addr || addr >= encoder->percpu.base_addr + encoder->percpu.sec_sz)
-			continue;
-		addr -= encoder->percpu.base_addr;
-
-		if (!btf_encoder__percpu_var_exists(encoder, addr, &size, &name))
-			continue; /* not a per-CPU variable */
 
 		/* A lot of "special" DWARF variables (e.g, __UNIQUE_ID___xxx)
 		 * have addr == 0, which is the same as, say, valid
@@ -1238,17 +1083,12 @@ static int btf_encoder__encode_cu_variables(struct btf_encoder *encoder, struct 
 		 *  modules per-CPU data section has non-zero offset so all
 		 *  per-CPU symbols have non-zero values.
 		 */
-		if (var->ip.addr == 0) {
-			if (!dwarf_name || strcmp(dwarf_name, name))
-				continue;
-		}
-
-		if (var->spec)
-			var = var->spec;
+		if (!dwarf_name)
+			continue;
 
 		if (var->ip.tag.type == 0) {
 			fprintf(stderr, "error: found variable '%s' in CU '%s' that has void type\n",
-				name, cu->name);
+				dwarf_name, cu->name);
 			if (encoder->force)
 				continue;
 			err = -1;
@@ -1267,14 +1107,14 @@ static int btf_encoder__encode_cu_variables(struct btf_encoder *encoder, struct 
 
 		if (encoder->verbose) {
 			printf("Variable '%s' from CU '%s' at address 0x%" PRIx64 " encoded\n",
-			       name, cu->name, addr);
+			       dwarf_name, cu->name, addr);
 		}
 
 		/* add a BTF_KIND_VAR in encoder->types */
-		id = btf_encoder__add_var(encoder, type, name, linkage);
+		id = btf_encoder__add_var(encoder, type, dwarf_name, linkage);
 		if (id < 0) {
 			fprintf(stderr, "error: failed to encode variable '%s' at addr 0x%" PRIx64 "\n",
-			        name, addr);
+			        dwarf_name, addr);
 			goto out;
 		}
 
@@ -1282,20 +1122,9 @@ static int btf_encoder__encode_cu_variables(struct btf_encoder *encoder, struct 
 			int tag_type_id = btf_encoder__add_decl_tag(encoder, annot->value, id, annot->component_idx);
 			if (tag_type_id < 0) {
 				fprintf(stderr, "error: failed to encode tag '%s' to variable '%s' with component_idx %d\n",
-					annot->value, name, annot->component_idx);
+					annot->value, dwarf_name, annot->component_idx);
 				goto out;
 			}
-		}
-
-		/*
-		 * add a BTF_VAR_SECINFO in encoder->percpu_secinfo, which will be added into
-		 * encoder->types later when we add BTF_VAR_DATASEC.
-		 */
-		id = btf_encoder__add_var_secinfo(encoder, id, addr, size);
-		if (id < 0) {
-			fprintf(stderr, "error: failed to encode section info for variable '%s' at addr 0x%" PRIx64 "\n",
-			        name, addr);
-			goto out;
 		}
 	}
 
@@ -1353,20 +1182,6 @@ struct btf_encoder *btf_encoder__new(struct cu *cu, const char *detached_filenam
 			if (encoder->verbose)
 				printf("%s: '%s' doesn't have symtab.\n", __func__, cu->filename);
 			goto out;
-		}
-
-		/* find percpu section's shndx */
-
-		GElf_Shdr shdr;
-		Elf_Scn *sec = elf_section_by_name(cu->elf, &shdr, PERCPU_SECTION, NULL);
-
-		if (!sec) {
-			if (encoder->verbose)
-				printf("%s: '%s' doesn't have '%s' section\n", __func__, cu->filename, PERCPU_SECTION);
-		} else {
-			encoder->percpu.shndx	  = elf_ndxscn(sec);
-			encoder->percpu.base_addr = shdr.sh_addr;
-			encoder->percpu.sec_sz	  = shdr.sh_size;
 		}
 
 		if (btf_encoder__collect_symbols(encoder, !encoder->skip_encoding_vars))

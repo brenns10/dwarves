@@ -2137,8 +2137,8 @@ static size_t get_elf_section(struct btf_encoder *encoder, uint64_t addr)
 	/* Start at index 1 to ignore initial SHT_NULL section */
 	for (size_t i = 1; i < encoder->seccnt; i++) {
 		/* Variables are only present in PROGBITS or NOBITS (.bss) */
-		if (encoder->secinfo[i].type == SHT_PROGBITS ||
-		    encoder->secinfo[i].type == SHT_NOBITS)
+		if (!(encoder->secinfo[i].type == SHT_PROGBITS ||
+		     encoder->secinfo[i].type == SHT_NOBITS))
 			continue;
 
 		if (encoder->secinfo[i].addr <= addr &&

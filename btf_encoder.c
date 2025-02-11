@@ -868,7 +868,35 @@ static int32_t btf_encoder__add_decl_tag(struct btf_encoder *encoder, const char
 static int32_t btf_encoder__encode_stored_vars(struct btf_encoder *encoder,
 					       struct saved_var *var, uint16_t nr)
 {
+	int prev = 0;
 	for (int i = 0; i < nr; i++) {
+		if (i && var[i].offset == var[prev].offset) {
+			/* The offset of this var is the same as the previous.
+			 * This can happen when a variable is declared in one CU
+			 * as "__weak", and then overridden in another CU. There
+			 * is no indication in the DWARF which symbol is weak,
+			 * so we need to deduplicate. If the duplicate is the
+			 * same name, this is expected, and we can just drop the
+			 * second instance. Otherwise, we need to raise an
+			 * error.
+			 *
+			 * Ideally, we would like to verify that the types of
+			 * the duplicated variables are the same type as well.
+			 * However, there's no way to do this without
+			 * deduplicating the BTF, but at that point, our type
+			 * IDs won't be valid.
+			 */
+			if (strcmp(var[i].name, var[prev].name) == 0) {
+				var[i].type = 0; /* Don't encode corresponding secinfo */
+				continue;
+			} else {
+				fprintf(stderr, "error: encountered variable \"%s\" (type %x) at offset \"%x\""
+					" which duplicates variable \"%s\" at the same offset\n",
+					var[i].name, var[i].type, var[i].offset, var[prev].name);
+				return -1;
+			}
+		}
+
 		int id = btf_encoder__add_var(encoder, var[i].type,
 					      var[i].name, var[i].linkage);
 		if (id < 0) {
@@ -891,6 +919,7 @@ static int32_t btf_encoder__encode_stored_vars(struct btf_encoder *encoder,
 		free(var->annots);
 		var->annots = NULL;
 
+		prev = i;
 		var[i].type = id;
 	}
 	return 0;

@@ -827,6 +827,27 @@ static int32_t btf_encoder__add_var(struct btf_encoder *encoder, uint32_t type, 
 	return id;
 }
 
+static int32_t btf_encoder__add_decl_tag(struct btf_encoder *encoder, const char *value, uint32_t type,
+					 int component_idx)
+{
+	struct btf *btf = encoder->btf;
+	const struct btf_type *t;
+	int32_t id;
+
+	id = btf__add_decl_tag(btf, value, type, component_idx);
+	if (id > 0) {
+		t = btf__type_by_id(btf, id);
+		btf_encoder__log_type(encoder, t, false, true, "type_id=%u component_idx=%d",
+				      t->type, component_idx);
+	} else {
+		btf__log_err(btf, BTF_KIND_DECL_TAG, value, true, id,
+			     "component_idx=%d Error emitting BTF type",
+			     component_idx);
+	}
+
+	return id;
+}
+
 static int32_t btf_encoder__add_var_secinfo(struct btf_encoder *encoder, size_t shndx,
 					    uint32_t type, uint32_t offset, uint32_t size)
 {
@@ -878,27 +899,6 @@ static int32_t btf_encoder__add_datasec(struct btf_encoder *encoder, size_t shnd
 				       vsi->type, vsi->offset, vsi->size);
 			return -1;
 		}
-	}
-
-	return id;
-}
-
-static int32_t btf_encoder__add_decl_tag(struct btf_encoder *encoder, const char *value, uint32_t type,
-					 int component_idx)
-{
-	struct btf *btf = encoder->btf;
-	const struct btf_type *t;
-	int32_t id;
-
-	id = btf__add_decl_tag(btf, value, type, component_idx);
-	if (id > 0) {
-		t = btf__type_by_id(btf, id);
-		btf_encoder__log_type(encoder, t, false, true, "type_id=%u component_idx=%d",
-				      t->type, component_idx);
-	} else {
-		btf__log_err(btf, BTF_KIND_DECL_TAG, value, true, id,
-			     "component_idx=%d Error emitting BTF type",
-			     component_idx);
 	}
 
 	return id;

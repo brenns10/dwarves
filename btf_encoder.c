@@ -97,7 +97,7 @@ struct elf_secinfo {
 	uint64_t    sz;
 	uint32_t    type;
 	bool        include;
-	struct gobuffer secinfo;
+	struct gobuffer vars;
 };
 
 struct elf_functions {
@@ -107,6 +107,20 @@ struct elf_functions {
 	struct elf_function *entries;
 	int cnt;
 	int suffix_cnt; /* number of .isra, .part etc */
+};
+
+struct saved_annot {
+	const char *value;
+	int component_idx;
+};
+
+struct saved_var {
+	const char *name;
+	uint32_t type;
+	struct saved_annot *annots;
+	uint32_t linkage;
+	uint32_t offset;
+	uint32_t size;
 };
 
 /*
@@ -243,12 +257,15 @@ static struct elf_functions *elf_functions__find(const Elf *elf, const struct li
 #define elf_error(fmt, ...) \
 	fprintf(stderr, "%s: " fmt ": %s.\n", __func__, ##__VA_ARGS__, elf_errmsg(-1))
 
-static int btf_var_secinfo_cmp(const void *a, const void *b)
+static int saved_var_cmp(const void *a, const void *b)
 {
-	const struct btf_var_secinfo *av = a;
-	const struct btf_var_secinfo *bv = b;
+	const struct saved_var *av = a;
+	const struct saved_var *bv = b;
 
-	return av->offset - bv->offset;
+	if (av->offset != bv->offset)
+		return av->offset - bv->offset;
+	else
+		return strcmp(av->name, bv->name);
 }
 
 #define BITS_PER_BYTE 8
@@ -848,55 +865,98 @@ static int32_t btf_encoder__add_decl_tag(struct btf_encoder *encoder, const char
 	return id;
 }
 
-static int32_t btf_encoder__add_var_secinfo(struct btf_encoder *encoder, size_t shndx,
-					    uint32_t type, uint32_t offset, uint32_t size)
+static int32_t btf_encoder__encode_stored_vars(struct btf_encoder *encoder,
+					       struct saved_var *var, uint16_t nr)
 {
-	struct btf_var_secinfo si = {
+	for (int i = 0; i < nr; i++) {
+		int id = btf_encoder__add_var(encoder, var[i].type,
+					      var[i].name, var[i].linkage);
+		if (id < 0) {
+			fprintf(stderr, "error: failed to encode variable '%s' at offset 0x%x\n",
+				var[i].name, var[i].offset);
+			return -1;
+		}
+
+		int annot_idx = 0;
+		while (var->annots && var->annots[annot_idx].value) {
+			struct saved_annot *annot = &var->annots[annot_idx++];
+			int tag_type_id = btf_encoder__add_decl_tag(encoder, annot->value,
+								    id, annot->component_idx);
+			if (tag_type_id < 0) {
+				fprintf(stderr, "error: failed to encode tag '%s' to variable '%s' with component_idx %d\n",
+					annot->value, var[i].name, annot->component_idx);
+				return -1;
+			}
+		}
+		free(var->annots);
+		var->annots = NULL;
+
+		var[i].type = id;
+	}
+	return 0;
+}
+
+static int32_t btf_encoder__store_var(struct btf_encoder *encoder, size_t shndx,
+				      const char *name, uint32_t type, uint32_t linkage,
+				      uint32_t offset, uint32_t size, struct saved_annot *annots)
+{
+	struct saved_var var = {
+		.name = name,
 		.type = type,
+		.linkage = linkage,
+		.annots = annots,
 		.offset = offset,
 		.size = size,
 	};
-	return gobuffer__add(&encoder->secinfo[shndx].secinfo, &si, sizeof(si));
+	return gobuffer__add(&encoder->secinfo[shndx].vars, &var, sizeof(var));
 }
 
 static int32_t btf_encoder__add_datasec(struct btf_encoder *encoder, size_t shndx)
 {
-	struct gobuffer *var_secinfo_buf = &encoder->secinfo[shndx].secinfo;
+	struct gobuffer *saved_var_buf = &encoder->secinfo[shndx].vars;
 	const char *section_name = encoder->secinfo[shndx].name;
 	struct btf *btf = encoder->btf;
-	size_t sz = gobuffer__size(var_secinfo_buf);
-	uint16_t nr_var_secinfo = sz / sizeof(struct btf_var_secinfo);
-	struct btf_var_secinfo *last_vsi, *vsi;
+	size_t sz = gobuffer__size(saved_var_buf);
+	uint16_t nr_saved_var = sz / sizeof(struct saved_var);
+	struct saved_var *last_sv, *sv;
 	const struct btf_type *t;
 	uint32_t datasec_sz;
 	int32_t err, id, i;
 
-	qsort(var_secinfo_buf->entries, nr_var_secinfo,
-	      sizeof(struct btf_var_secinfo), btf_var_secinfo_cmp);
+	qsort(saved_var_buf->entries, nr_saved_var,
+	      sizeof(struct saved_var), saved_var_cmp);
 
-	last_vsi = (struct btf_var_secinfo *)var_secinfo_buf->entries + nr_var_secinfo - 1;
-	datasec_sz = last_vsi->offset + last_vsi->size;
+	err = btf_encoder__encode_stored_vars(encoder,
+					      (struct saved_var *)saved_var_buf->entries,
+					      nr_saved_var);
+	if (err < 0)
+		return -1;
+
+	last_sv = (struct saved_var *)saved_var_buf->entries + nr_saved_var - 1;
+	datasec_sz = last_sv->offset + last_sv->size;
 
 	id = btf__add_datasec(btf, section_name, datasec_sz);
 	if (id < 0) {
 		btf__log_err(btf, BTF_KIND_DATASEC, section_name, true, id,
 			     "size=%u vlen=%u Error emitting BTF type",
-			     datasec_sz, nr_var_secinfo);
+			     datasec_sz, nr_saved_var);
 	} else {
 		t = btf__type_by_id(btf, id);
-		btf_encoder__log_type(encoder, t, false, true, "size=%u vlen=%u", t->size, nr_var_secinfo);
+		btf_encoder__log_type(encoder, t, false, true, "size=%u vlen=%u", t->size, nr_saved_var);
 	}
 
-	for (i = 0; i < nr_var_secinfo; i++) {
-		vsi = (struct btf_var_secinfo *)var_secinfo_buf->entries + i;
-		err = btf__add_datasec_var_info(btf, vsi->type, vsi->offset, vsi->size);
+	for (i = 0; i < nr_saved_var; i++) {
+		sv = (struct saved_var *)saved_var_buf->entries + i;
+		if (sv->type == 0)
+			continue;
+		err = btf__add_datasec_var_info(btf, sv->type, sv->offset, sv->size);
 		if (!err) {
 			if (encoder->verbose)
 				printf("\ttype=%u offset=%u size=%u\n",
-				       vsi->type, vsi->offset, vsi->size);
+				       sv->type, sv->offset, sv->size);
 		} else {
 			fprintf(stderr, "\ttype=%u offset=%u size=%u Error emitting BTF datasec var info\n",
-				       vsi->type, vsi->offset, vsi->size);
+				       sv->type, sv->offset, sv->size);
 			return -1;
 		}
 	}
@@ -2091,9 +2151,13 @@ int btf_encoder__encode(struct btf_encoder *encoder, struct conf_load *conf)
 	if (err < 0)
 		return err;
 
-	for (shndx = 1; shndx < encoder->seccnt; shndx++)
-		if (gobuffer__size(&encoder->secinfo[shndx].secinfo))
-			btf_encoder__add_datasec(encoder, shndx);
+	for (shndx = 1; shndx < encoder->seccnt; shndx++) {
+		if (gobuffer__size(&encoder->secinfo[shndx].vars)) {
+			err = btf_encoder__add_datasec(encoder, shndx);
+			if (err < 0)
+				return -1;
+		}
+	}
 
 	/* Empty file, nothing to do, so... done! */
 	if (btf__type_cnt(encoder->btf) == 1)
@@ -2266,6 +2330,8 @@ static int btf_encoder__encode_cu_variables(struct btf_encoder *encoder)
 		uint32_t type, linkage;
 		const char *name;
 		struct llvm_annotation *annot;
+		int annot_count;
+		struct saved_annot *annots;
 		const struct tag *tag;
 		size_t shndx, size;
 		uint64_t addr;
@@ -2359,29 +2425,32 @@ static int btf_encoder__encode_cu_variables(struct btf_encoder *encoder)
 			       name, cu->name, addr);
 		}
 
-		/* add a BTF_KIND_VAR in encoder->types */
-		id = btf_encoder__add_var(encoder, type, name, linkage);
-		if (id < 0) {
-			fprintf(stderr, "error: failed to encode variable '%s' at addr 0x%" PRIx64 "\n",
-			        name, addr);
-			goto out;
-		}
-
+		/* Save the annotations */
+		annot_count = 0;
+		annots = NULL;
 		list_for_each_entry(annot, &var->annots, node) {
-			int tag_type_id = btf_encoder__add_decl_tag(encoder, annot->value, id, annot->component_idx);
-			if (tag_type_id < 0) {
-				fprintf(stderr, "error: failed to encode tag '%s' to variable '%s' with component_idx %d\n",
-					annot->value, name, annot->component_idx);
+			annot_count += 1;
+		}
+		if (annot_count) {
+			int idx = 0;
+			annots = calloc(annot_count + 1, sizeof(*annots));
+			if (!annots) {
+				fprintf(stderr, "error: allocation failure\n");
+				err = -ENOMEM;
 				goto out;
+			}
+			list_for_each_entry(annot, &var->annots, node) {
+				annots[idx].value = annot->value;
+				annots[idx].component_idx = annot->component_idx;
 			}
 		}
 
 		/*
-		 * Add the variable to the secinfo for the section it appears in.
-		 * Later we will generate a BTF_VAR_DATASEC for all any section with
-		 * an encoded variable.
+		 * Store all the collected information for the variable. Later,
+		 * we will deduplicate and output all.
 		 */
-		id = btf_encoder__add_var_secinfo(encoder, shndx, id, (uint32_t)addr, (uint32_t)size);
+		id = btf_encoder__store_var(encoder, shndx, name, type, linkage,
+					    (uint32_t)addr, (uint32_t)size, annots);
 		if (id < 0) {
 			fprintf(stderr, "error: failed to encode section info for variable '%s' at addr 0x%" PRIx64 "\n",
 				name, addr);
@@ -2515,7 +2584,7 @@ void btf_encoder__delete(struct btf_encoder *encoder)
 		return;
 
 	for (shndx = 0; shndx < encoder->seccnt; shndx++)
-		__gobuffer__delete(&encoder->secinfo[shndx].secinfo);
+		__gobuffer__delete(&encoder->secinfo[shndx].vars);
 	free(encoder->secinfo);
 	zfree(&encoder->filename);
 	zfree(&encoder->source_filename);

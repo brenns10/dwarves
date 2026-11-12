@@ -642,7 +642,7 @@ esac
 exit 0
 EOF
 chmod +x "$outdir/mark-editor"
-export EDITOR="sh $outdir/mark-editor"
+export VISUAL="sh $outdir/mark-editor"
 if ! bash "$script" --yes --no-commit --no-tarball \
 		--no-build-check --no-tag > "$outdir/run.log" 2>&1; then
 	error_log "FAIL: prep-release.sh exited with an error:"

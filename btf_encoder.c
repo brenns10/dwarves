@@ -116,7 +116,6 @@ struct elf_secinfo {
 	uint64_t    addr;
 	const char *name;
 	uint64_t    sz;
-	uint32_t    type;
 	bool        include;
 	struct gobuffer secinfo;
 };
@@ -2658,11 +2657,6 @@ static size_t get_elf_section(struct btf_encoder *encoder, uint64_t addr)
 {
 	/* Start at index 1 to ignore initial SHT_NULL section */
 	for (size_t i = 1; i < encoder->seccnt; i++) {
-		/* Variables are only present in PROGBITS or NOBITS (.bss) */
-		if (!(encoder->secinfo[i].type == SHT_PROGBITS ||
-		     encoder->secinfo[i].type == SHT_NOBITS))
-			continue;
-
 		if (encoder->secinfo[i].addr <= addr &&
 		    (addr - encoder->secinfo[i].addr) < encoder->secinfo[i].sz)
 			return i;
@@ -2977,10 +2971,15 @@ struct btf_encoder *btf_encoder__new(struct cu *cu, const char *detached_filenam
 			Elf_Scn *sec = elf_section_by_idx(cu->elf, &shdr, shndx, &secname);
 			if (!sec)
 				goto out_delete;
+			/* Variables are only present in PROGBITS or NOBITS (.bss) */
+			if (!(shdr.sh_type == SHT_PROGBITS || shdr.sh_type == SHT_NOBITS))
+				continue;
+			/* Variables are only present in runtime allocated sections. */
+			if (!(shdr.sh_flags & SHF_ALLOC))
+				continue;
 			encoder->secinfo[shndx].addr = shdr.sh_addr;
 			encoder->secinfo[shndx].sz = shdr.sh_size;
 			encoder->secinfo[shndx].name = secname;
-			encoder->secinfo[shndx].type = shdr.sh_type;
 
 			if (encoder->encode_vars & BTF_VAR_GLOBAL)
 				encoder->secinfo[shndx].include = true;

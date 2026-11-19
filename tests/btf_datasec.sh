@@ -4,7 +4,8 @@
 #
 # Test BTF VAR and DATASEC encoding for global variables via
 # btf_encoder__add_var() and btf_encoder__add_datasec() in btf_encoder.c,
-# exercised through --btf_features=global_var on a small linked binary.
+# exercised through --btf_features=global_var on a small linked binary
+# and a relocatable object with overlapping non-allocated sections.
 #
 # External globals and statics must each produce a BTF_KIND_VAR entry with
 # the correct linkage, and their ELF section must appear as a
@@ -118,5 +119,58 @@ else
 	# Old bpftool doesn't show VAR references in DATASEC - just verify VARs exist
 	info_log "DATASEC VAR references: skipped (old bpftool format)"
 fi
+
+# For ET_REL files, libdwfl assigns synthetic addresses starting at 0x10000
+# to allocated sections. Non-allocated sections retain address zero, so a
+# sufficiently large one appears to overlap the variables' addresses.
+# Put one before .late_data to catch lookups that ignore SHF_ALLOC.
+cat > "$src" << 'EOF'
+asm(".pushsection .debug_padding, \"\"\n"
+    ".zero 0x20000\n"
+    ".popsection\n");
+int late_first __attribute__((section(".late_data"))) = 1;
+int late_second __attribute__((section(".late_data"))) = 2;
+EOF
+
+obj="$outdir/btf_datasec.o"
+btf="$outdir/btf_datasec_rel.btf"
+if ! $CC -g -O0 -c -o "$obj" "$src" 2>/dev/null; then
+	error_log "FAIL: relocatable object compilation failed"
+	test_fail
+fi
+
+if ! pahole --btf_features=global_var --btf_encode_detached="$btf" "$obj" 2>/dev/null; then
+	error_log "FAIL: relocatable object BTF encoding failed"
+	test_fail
+fi
+
+dump=$(bpftool btf dump file "$btf" 2>/dev/null)
+if ! echo "$dump" | grep -q "DATASEC '\.late_data' size=8 vlen=2"; then
+	error_log "FAIL: expected two variables in .late_data DATASEC"
+	test_fail
+fi
+if echo "$dump" | grep -q "DATASEC '\.debug_padding'"; then
+	error_log "FAIL: non-allocated .debug_padding encoded as a DATASEC"
+	test_fail
+fi
+
+for var in late_first late_second; do
+	if ! echo "$dump" | grep -q "VAR '$var'"; then
+		error_log "FAIL: BTF_KIND_VAR '$var' not found"
+		test_fail
+	fi
+done
+
+if echo "$dump" | grep -q "(VAR '"; then
+	for var in late_first late_second; do
+		if ! echo "$dump" | grep -q "(VAR '$var')"; then
+			error_log "FAIL: no DATASEC references VAR '$var'"
+			test_fail
+		fi
+	done
+else
+	info_log "DATASEC VAR references: skipped (old bpftool format)"
+fi
+info_log "Relocatable object ignores non-allocated sections: ok"
 
 test_pass
